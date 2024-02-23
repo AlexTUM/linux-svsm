@@ -644,6 +644,23 @@ static int svsm_protocol(struct svsm_call *call)
 	return ret;
 }
 
+int do_svsm_protocol(struct svsm_call * call){
+	
+	unsigned long flags;
+	int ret;
+
+	local_irq_save(flags);
+
+	call->caa = this_cpu_read(svsm_caa);
+
+	ret = svsm_protocol(call);
+
+	local_irq_restore(flags);
+
+	return ret;
+}
+EXPORT_SYMBOL(do_svsm_protocol);
+
 void noinstr __sev_es_nmi_complete(void)
 {
 	struct ghcb_state state;

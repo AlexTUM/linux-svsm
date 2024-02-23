@@ -280,11 +280,14 @@ static int __svsm_ghcb_protocol(struct ghcb *ghcb, struct svsm_call *call)
 	ghcb_set_sw_exit_info_2(ghcb, 0);
 
 	sev_es_wr_ghcb_msr(__pa(ghcb));
-	asm volatile("mov %4, %%r8\n\t"
-		     "mov %5, %%r9\n\t"
-		     "movb $1, %6\n\t"
+	asm volatile("mov %8, %%r8\n\t"
+		     "mov %9, %%r9\n\t"
+		     "movb $1, %10\n\t"
 		     "rep; vmmcall\n\t"
-		     : "=a" (ret)
+			 "mov %%r8, %3\n\t"
+			 "mov %%r9, %4\n\t"
+		     : "=a" (ret), "=c" (call->rcx), "=d" (call->rdx),
+			  "=r" (call->r8), "=r" (call->r9)
 		     : "a" (call->rax), "c" (call->rcx), "d" (call->rdx),
 		       "r" (call->r8), "r" (call->r9), "m" (call->caa->call_pending)
 		     : "r8", "r9");
