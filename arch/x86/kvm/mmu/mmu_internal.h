@@ -203,6 +203,7 @@ struct kvm_page_fault {
 
 	/* Derived from mmu and global state.  */
 	const bool is_tdp;
+	const bool is_private;
 	const bool nx_huge_page_workaround_enabled;
 
 	/*
@@ -251,6 +252,33 @@ struct kvm_page_fault {
 
 int kvm_tdp_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault);
 
+static bool kvm_mmu_fault_is_private(struct kvm *kvm, gpa_t gpa, u64 err)
+{
+	struct kvm_memory_slot *slot;
+	gfn_t gfn = gpa_to_gfn(gpa);
+	bool private_fault = false;
+
+	slot = gfn_to_memslot(kvm, gfn);
+	if (!slot) {
+               pr_debug("%s: no slot, GFN: 0x%llx\n", __func__, gfn);
+               goto out;
+       }
+
+	if (kvm_is_vm_type(kvm, KVM_X86_SNP_VM)) {
+		private_fault = !!(err & PFERR_GUEST_ENC_MASK);
+	} else if (kvm_is_vm_type(kvm, KVM_X86_SW_PROTECTED_VM)) {
+		/*
+		 * This handling is for UPM self-tests and guests that treat userspace
+		 * as the authority on whether a fault should be private or not.
+		 */
+		private_fault = kvm_mem_is_private(kvm, gpa >> PAGE_SHIFT);
+	}
+
+out:
+	pr_debug("%s: GFN: 0x%llx, private: %d\n", __func__, gfn, private_fault);
+	return private_fault;
+}
+
 /*
  * Return values of handle_mmio_page_fault(), mmu.page_fault(), fast_page_fault(),
  * and of course kvm_mmu_do_page_fault().
@@ -259,6 +287,7 @@ int kvm_tdp_page_fault(struct kvm_vcpu *vcpu, struct kvm_page_fault *fault);
  * RET_PF_RETRY: let CPU fault again on the address.
  * RET_PF_EMULATE: mmio page fault, emulate the instruction directly.
  * RET_PF_INVALID: the spte is invalid, let the real page fault path update it.
+ * RET_PF_USER: need to exit to userspace to handle this fault.
  * RET_PF_FIXED: The faulting entry has been fixed.
  * RET_PF_SPURIOUS: The faulting entry was already fixed, e.g. by another vCPU.
  *
@@ -275,16 +304,17 @@ enum {
 	RET_PF_RETRY,
 	RET_PF_EMULATE,
 	RET_PF_INVALID,
+	RET_PF_USER,
 	RET_PF_FIXED,
 	RET_PF_SPURIOUS,
 };
 
 static inline int kvm_mmu_do_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
-					u32 err, bool prefetch, int *emulation_type)
+					u64 err, bool prefetch, int *emulation_type)
 {
 	struct kvm_page_fault fault = {
 		.addr = cr2_or_gpa,
-		.error_code = err,
+		.error_code = lower_32_bits(err),
 		.exec = err & PFERR_FETCH_MASK,
 		.write = err & PFERR_WRITE_MASK,
 		.present = err & PFERR_PRESENT_MASK,
@@ -298,6 +328,7 @@ static inline int kvm_mmu_do_page_fault(struct kvm_vcpu *vcpu, gpa_t cr2_or_gpa,
 		.max_level = KVM_MAX_HUGEPAGE_LEVEL,
 		.req_level = PG_LEVEL_4K,
 		.goal_level = PG_LEVEL_4K,
+		.is_private = kvm_mmu_fault_is_private(vcpu->kvm, cr2_or_gpa, err),
 	};
 	int r;
 

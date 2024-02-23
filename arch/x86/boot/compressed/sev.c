@@ -12,6 +12,7 @@
  */
 #include "misc.h"
 
+#include <linux/mm.h>
 #include <asm/pgtable_types.h>
 #include <asm/sev.h>
 #include <asm/trapnr.h>
@@ -27,6 +28,20 @@
 
 struct ghcb boot_ghcb_page __aligned(PAGE_SIZE);
 struct ghcb *boot_ghcb;
+
+static u8 svsm_vmpl __section(".data");
+static u64 boot_svsm_caa_pa __section(".data");
+static struct svsm_caa *boot_svsm_caa __section(".data");
+
+static struct svsm_caa *__svsm_get_caa(void)
+{
+	return boot_svsm_caa;
+}
+
+static u64 __svsm_get_caa_pa(void)
+{
+	return boot_svsm_caa_pa;
+}
 
 /*
  * Copy a version of this function here - insn-eval.c can't be used in
@@ -115,6 +130,24 @@ static enum es_result vc_read_mem(struct es_em_ctxt *ctxt,
 /* Include code for early handlers */
 #include "../../kernel/sev-shared.c"
 
+static int svsm_protocol(struct svsm_call *call)
+{
+	struct ghcb *ghcb;
+	int ret;
+
+	if (boot_ghcb)
+		ghcb = boot_ghcb;
+	else
+		ghcb = NULL;
+
+	do {
+		ret = ghcb ? __svsm_ghcb_protocol(ghcb, call)
+			   : __svsm_msr_protocol(call);
+	} while (ret == SVSM_ERR_BUSY);
+
+	return ret;
+}
+
 bool sev_snp_enabled(void)
 {
 	return sev_status & MSR_AMD64_SEV_SNP_ENABLED;
@@ -131,8 +164,8 @@ static void __page_state_change(unsigned long paddr, enum psc_op op)
 	 * If private -> shared then invalidate the page before requesting the
 	 * state change in the RMP table.
 	 */
-	if (op == SNP_PAGE_STATE_SHARED && pvalidate(paddr, RMP_PG_SIZE_4K, 0))
-		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_PVALIDATE);
+	if (op == SNP_PAGE_STATE_SHARED)
+		pvalidate_4k_page(paddr, paddr, 0);
 
 	/* Issue VMGEXIT to change the page state in RMP table. */
 	sev_es_wr_ghcb_msr(GHCB_MSR_PSC_REQ_GFN(paddr >> PAGE_SHIFT, op));
@@ -147,8 +180,8 @@ static void __page_state_change(unsigned long paddr, enum psc_op op)
 	 * Now that page state is changed in the RMP table, validate it so that it is
 	 * consistent with the RMP entry.
 	 */
-	if (op == SNP_PAGE_STATE_PRIVATE && pvalidate(paddr, RMP_PG_SIZE_4K, 1))
-		sev_es_terminate(SEV_TERM_SET_LINUX, GHCB_TERM_PVALIDATE);
+	if (op == SNP_PAGE_STATE_PRIVATE)
+		pvalidate_4k_page(paddr, paddr, 1);
 }
 
 void snp_set_page_private(unsigned long paddr)
@@ -242,6 +275,12 @@ void sev_es_shutdown_ghcb(void)
 		error("SEV-ES CPU Features missing.");
 
 	/*
+	 * Ensure that the boot GHCB isn't used for the PVALIDATE when running
+	 * under an SVSM.
+	 */
+	boot_ghcb = NULL;
+
+	/*
 	 * GHCB Page must be flushed from the cache and mapped encrypted again.
 	 * Otherwise the running kernel will see strange cache effects when
 	 * trying to use that page.
@@ -317,10 +356,17 @@ finish:
 		sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SEV_ES_GEN_REQ);
 }
 
-static void enforce_vmpl0(void)
+static void enforce_vmpl(u64 hv_features)
 {
 	u64 attrs;
 	int err;
+
+	/*
+	 * VMPL0 is not required if an SVSM is present and the hypervisor
+	 * supports the required SVSM GHCB events.
+	 */
+	if (svsm_vmpl && (hv_features & GHCB_HV_FT_SNP_SVSM))
+		return;
 
 	/*
 	 * RMPADJUST modifies RMP permissions of a lesser-privileged (numerically
@@ -328,8 +374,8 @@ static void enforce_vmpl0(void)
 	 * GHCB page. If the guest is not running at VMPL0, this will fail.
 	 *
 	 * If the guest is running at VMPL0, it will succeed. Even if that operation
-	 * modifies permission bits, it is still ok to do so currently because Linux
-	 * SNP guests are supported only on VMPL0 so VMPL1 or higher permission masks
+	 * modifies permission bits, it is still ok to do currently because the Linux
+	 * SNP guest will only run at VMPL0, so VMPL1 or higher permission masks
 	 * changing is a don't-care.
 	 */
 	attrs = 1;
@@ -390,113 +436,6 @@ void snp_check_features(void)
 	}
 }
 
-void sev_enable(struct boot_params *bp)
-{
-	unsigned int eax, ebx, ecx, edx;
-	struct msr m;
-	bool snp;
-
-	/*
-	 * bp->cc_blob_address should only be set by boot/compressed kernel.
-	 * Initialize it to 0 to ensure that uninitialized values from
-	 * buggy bootloaders aren't propagated.
-	 */
-	if (bp)
-		bp->cc_blob_address = 0;
-
-	/*
-	 * Do an initial SEV capability check before snp_init() which
-	 * loads the CPUID page and the same checks afterwards are done
-	 * without the hypervisor and are trustworthy.
-	 *
-	 * If the HV fakes SEV support, the guest will crash'n'burn
-	 * which is good enough.
-	 */
-
-	/* Check for the SME/SEV support leaf */
-	eax = 0x80000000;
-	ecx = 0;
-	native_cpuid(&eax, &ebx, &ecx, &edx);
-	if (eax < 0x8000001f)
-		return;
-
-	/*
-	 * Check for the SME/SEV feature:
-	 *   CPUID Fn8000_001F[EAX]
-	 *   - Bit 0 - Secure Memory Encryption support
-	 *   - Bit 1 - Secure Encrypted Virtualization support
-	 *   CPUID Fn8000_001F[EBX]
-	 *   - Bits 5:0 - Pagetable bit position used to indicate encryption
-	 */
-	eax = 0x8000001f;
-	ecx = 0;
-	native_cpuid(&eax, &ebx, &ecx, &edx);
-	/* Check whether SEV is supported */
-	if (!(eax & BIT(1)))
-		return;
-
-	/*
-	 * Setup/preliminary detection of SNP. This will be sanity-checked
-	 * against CPUID/MSR values later.
-	 */
-	snp = snp_init(bp);
-
-	/* Now repeat the checks with the SNP CPUID table. */
-
-	/* Recheck the SME/SEV support leaf */
-	eax = 0x80000000;
-	ecx = 0;
-	native_cpuid(&eax, &ebx, &ecx, &edx);
-	if (eax < 0x8000001f)
-		return;
-
-	/*
-	 * Recheck for the SME/SEV feature:
-	 *   CPUID Fn8000_001F[EAX]
-	 *   - Bit 0 - Secure Memory Encryption support
-	 *   - Bit 1 - Secure Encrypted Virtualization support
-	 *   CPUID Fn8000_001F[EBX]
-	 *   - Bits 5:0 - Pagetable bit position used to indicate encryption
-	 */
-	eax = 0x8000001f;
-	ecx = 0;
-	native_cpuid(&eax, &ebx, &ecx, &edx);
-	/* Check whether SEV is supported */
-	if (!(eax & BIT(1))) {
-		if (snp)
-			error("SEV-SNP support indicated by CC blob, but not CPUID.");
-		return;
-	}
-
-	/* Set the SME mask if this is an SEV guest. */
-	boot_rdmsr(MSR_AMD64_SEV, &m);
-	sev_status = m.q;
-	if (!(sev_status & MSR_AMD64_SEV_ENABLED))
-		return;
-
-	/* Negotiate the GHCB protocol version. */
-	if (sev_status & MSR_AMD64_SEV_ES_ENABLED) {
-		if (!sev_es_negotiate_protocol())
-			sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SEV_ES_PROT_UNSUPPORTED);
-	}
-
-	/*
-	 * SNP is supported in v2 of the GHCB spec which mandates support for HV
-	 * features.
-	 */
-	if (sev_status & MSR_AMD64_SEV_SNP_ENABLED) {
-		if (!(get_hv_features() & GHCB_HV_FT_SNP))
-			sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SNP_UNSUPPORTED);
-
-		enforce_vmpl0();
-	}
-
-	if (snp && !(sev_status & MSR_AMD64_SEV_SNP_ENABLED))
-		error("SEV-SNP supported indicated by CC blob, but not SEV status MSR.");
-
-	sme_me_mask = BIT_ULL(ebx & 0x3f);
-}
-
 /* Search for Confidential Computing blob in the EFI config table. */
 static struct cc_blob_sev_info *find_cc_blob_efi(struct boot_params *bp)
 {
@@ -546,7 +485,7 @@ found_cc_info:
  * Indicate SNP based on presence of SNP-specific CC blob. Subsequent checks
  * will verify the SNP CPUID/MSR bits.
  */
-bool snp_init(struct boot_params *bp)
+static bool snp_setup(struct boot_params *bp)
 {
 	struct cc_blob_sev_info *cc_info;
 
@@ -567,6 +506,13 @@ bool snp_init(struct boot_params *bp)
 	setup_cpuid_table(cc_info);
 
 	/*
+	 * Record the address of the SVSM CAA if the guest is not running
+	 * at VMPL0. The CAA will be used to communicate with the SVSM to
+	 * perform the SVSM services.
+	 */
+	setup_svsm_caa(cc_info);
+
+	/*
 	 * Pass run-time kernel a pointer to CC info via boot_params so EFI
 	 * config table doesn't need to be searched again during early startup
 	 * phase.
@@ -574,6 +520,115 @@ bool snp_init(struct boot_params *bp)
 	bp->cc_blob_address = (u32)(unsigned long)cc_info;
 
 	return true;
+}
+
+void sev_enable(struct boot_params *bp)
+{
+	unsigned int eax, ebx, ecx, edx;
+	struct msr m;
+	bool snp;
+
+	/*
+	 * bp->cc_blob_address should only be set by boot/compressed kernel.
+	 * Initialize it to 0 to ensure that uninitialized values from
+	 * buggy bootloaders aren't propagated.
+	 */
+	if (bp)
+		bp->cc_blob_address = 0;
+
+	/*
+	 * Do an initial SEV capability check before snp_setup() which
+	 * loads the CPUID page and the same checks afterwards are done
+	 * without the hypervisor and are trustworthy.
+	 *
+	 * If the HV fakes SEV support, the guest will crash'n'burn
+	 * which is good enough.
+	 */
+
+	/* Check for the SME/SEV support leaf */
+	eax = 0x80000000;
+	ecx = 0;
+	native_cpuid(&eax, &ebx, &ecx, &edx);
+	if (eax < 0x8000001f)
+		return;
+
+	/*
+	 * Check for the SME/SEV feature:
+	 *   CPUID Fn8000_001F[EAX]
+	 *   - Bit 0 - Secure Memory Encryption support
+	 *   - Bit 1 - Secure Encrypted Virtualization support
+	 *   CPUID Fn8000_001F[EBX]
+	 *   - Bits 5:0 - Pagetable bit position used to indicate encryption
+	 */
+	eax = 0x8000001f;
+	ecx = 0;
+	native_cpuid(&eax, &ebx, &ecx, &edx);
+	/* Check whether SEV is supported */
+	if (!(eax & BIT(1)))
+		return;
+
+	/*
+	 * Setup/preliminary detection of SNP. This will be sanity-checked
+	 * against CPUID/MSR values later.
+	 */
+	snp = snp_setup(bp);
+
+	/* Now repeat the checks with the SNP CPUID table. */
+
+	/* Recheck the SME/SEV support leaf */
+	eax = 0x80000000;
+	ecx = 0;
+	native_cpuid(&eax, &ebx, &ecx, &edx);
+	if (eax < 0x8000001f)
+		return;
+
+	/*
+	 * Recheck for the SME/SEV feature:
+	 *   CPUID Fn8000_001F[EAX]
+	 *   - Bit 0 - Secure Memory Encryption support
+	 *   - Bit 1 - Secure Encrypted Virtualization support
+	 *   CPUID Fn8000_001F[EBX]
+	 *   - Bits 5:0 - Pagetable bit position used to indicate encryption
+	 */
+	eax = 0x8000001f;
+	ecx = 0;
+	native_cpuid(&eax, &ebx, &ecx, &edx);
+	/* Check whether SEV is supported */
+	if (!(eax & BIT(1))) {
+		if (snp)
+			error("SEV-SNP support indicated by CC blob, but not CPUID.");
+		return;
+	}
+
+	/* Set the SME mask if this is an SEV guest. */
+	boot_rdmsr(MSR_AMD64_SEV, &m);
+	sev_status = m.q;
+	if (!(sev_status & MSR_AMD64_SEV_ENABLED))
+		return;
+
+	/* Negotiate the GHCB protocol version. */
+	if (sev_status & MSR_AMD64_SEV_ES_ENABLED) {
+		if (!sev_es_negotiate_protocol())
+			sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SEV_ES_PROT_UNSUPPORTED);
+	}
+
+	/*
+	 * SNP is supported in v2 of the GHCB spec which mandates support for HV
+	 * features.
+	 */
+	if (sev_status & MSR_AMD64_SEV_SNP_ENABLED) {
+		u64 hv_features = get_hv_features();
+
+		if (!(hv_features & GHCB_HV_FT_SNP))
+			sev_es_terminate(SEV_TERM_SET_GEN, GHCB_SNP_UNSUPPORTED);
+
+		enforce_vmpl(hv_features);
+	}
+
+	if (snp && !(sev_status & MSR_AMD64_SEV_SNP_ENABLED))
+		error("SEV-SNP supported indicated by CC blob, but not SEV status MSR.");
+
+	sme_me_mask = BIT_ULL(ebx & 0x3f);
 }
 
 void sev_prep_identity_maps(unsigned long top_level_pgt)

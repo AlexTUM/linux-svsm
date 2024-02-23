@@ -114,6 +114,14 @@ struct ghcb_state {
 
 static DEFINE_PER_CPU(struct sev_es_runtime_data*, runtime_data);
 static DEFINE_PER_CPU(struct sev_es_save_area *, sev_vmsa);
+static DEFINE_PER_CPU(struct svsm_caa *, svsm_caa);
+static DEFINE_PER_CPU(u64, svsm_caa_pa);
+
+static struct svsm_caa boot_svsm_caa_page __aligned(PAGE_SIZE);
+static struct svsm_caa *boot_svsm_caa __ro_after_init;
+static u64 boot_svsm_caa_pa __ro_after_init;
+
+static u8 svsm_vmpl __ro_after_init;
 
 struct sev_config {
 	__u64 debug		: 1,
@@ -129,10 +137,31 @@ struct sev_config {
 	       */
 	      ghcbs_initialized	: 1,
 
+	      /*
+	       * A flag used to indicate when the per-CPU SVSM CAA is to be
+	       * used instead of the boot SVSM CAA.
+	       *
+	       * For APs, the per-CPU SVSM CAA is created as part of the AP
+	       * bringup, so this flag can be used globally for the BSP and APs.
+	       */
+	      cas_initialized	: 1,
+
 	      __reserved	: 62;
 };
 
 static struct sev_config sev_cfg __read_mostly;
+
+static struct svsm_caa *__svsm_get_caa(void)
+{
+	return sev_cfg.cas_initialized ? this_cpu_read(svsm_caa)
+				       : boot_svsm_caa;
+}
+
+static u64 __svsm_get_caa_pa(void)
+{
+	return sev_cfg.cas_initialized ? this_cpu_read(svsm_caa_pa)
+				       : boot_svsm_caa_pa;
+}
 
 static __always_inline bool on_vc_stack(struct pt_regs *regs)
 {
@@ -524,6 +553,33 @@ static enum es_result vc_slow_virt_to_phys(struct ghcb *ghcb, struct es_em_ctxt 
 	return ES_OK;
 }
 
+static __always_inline void vc_forward_exception(struct es_em_ctxt *ctxt)
+{
+	long error_code = ctxt->fi.error_code;
+	int trapnr = ctxt->fi.vector;
+
+	ctxt->regs->orig_ax = ctxt->fi.error_code;
+
+	switch (trapnr) {
+	case X86_TRAP_GP:
+		exc_general_protection(ctxt->regs, error_code);
+		break;
+	case X86_TRAP_UD:
+		exc_invalid_op(ctxt->regs);
+		break;
+	case X86_TRAP_PF:
+		write_cr2(ctxt->fi.cr2);
+		exc_page_fault(ctxt->regs, error_code);
+		break;
+	case X86_TRAP_AC:
+		exc_alignment_check(ctxt->regs, error_code);
+		break;
+	default:
+		pr_emerg("Unsupported exception in #VC instruction emulation - can't continue\n");
+		BUG();
+	}
+}
+
 /* Include code shared with pre-decompression boot stage */
 #include "sev-shared.c"
 
@@ -550,6 +606,42 @@ static noinstr void __sev_put_ghcb(struct ghcb_state *state)
 		vc_ghcb_invalidate(ghcb);
 		data->ghcb_active = false;
 	}
+}
+
+static int svsm_protocol(struct svsm_call *call)
+{
+	struct ghcb_state state;
+	unsigned long flags;
+	struct ghcb *ghcb;
+	int ret;
+
+	/*
+	 * This can be called very early in the boot, use native functions in
+	 * order to avoid paravirt issues.
+	 */
+	flags = native_save_fl();
+	if (flags & X86_EFLAGS_IF)
+		native_irq_disable();
+
+	if (sev_cfg.ghcbs_initialized)
+		ghcb = __sev_get_ghcb(&state);
+	else if (boot_ghcb)
+		ghcb = boot_ghcb;
+	else
+		ghcb = NULL;
+
+	do {
+		ret = ghcb ? __svsm_ghcb_protocol(ghcb, call)
+			   : __svsm_msr_protocol(call);
+	} while (ret == SVSM_ERR_BUSY);
+
+	if (sev_cfg.ghcbs_initialized)
+		__sev_put_ghcb(&state);
+
+	if (flags & X86_EFLAGS_IF)
+		native_irq_enable();
+
+	return ret;
 }
 
 void noinstr __sev_es_nmi_complete(void)
@@ -660,7 +752,6 @@ static void early_set_pages_state(unsigned long vaddr, unsigned long paddr,
 {
 	unsigned long paddr_end;
 	u64 val;
-	int ret;
 
 	vaddr = vaddr & PAGE_MASK;
 
@@ -668,12 +759,9 @@ static void early_set_pages_state(unsigned long vaddr, unsigned long paddr,
 	paddr_end = paddr + (npages << PAGE_SHIFT);
 
 	while (paddr < paddr_end) {
-		if (op == SNP_PAGE_STATE_SHARED) {
-			/* Page validation must be rescinded before changing to shared */
-			ret = pvalidate(vaddr, RMP_PG_SIZE_4K, false);
-			if (WARN(ret, "Failed to validate address 0x%lx ret %d", paddr, ret))
-				goto e_term;
-		}
+		/* Page validation must be rescinded before changing to shared */
+		if (op == SNP_PAGE_STATE_SHARED)
+			pvalidate_4k_page(vaddr, paddr, false);
 
 		/*
 		 * Use the MSR protocol because this function can be called before
@@ -695,12 +783,9 @@ static void early_set_pages_state(unsigned long vaddr, unsigned long paddr,
 			 paddr, GHCB_MSR_PSC_RESP_VAL(val)))
 			goto e_term;
 
-		if (op == SNP_PAGE_STATE_PRIVATE) {
-			/* Page validation must be performed after changing to private */
-			ret = pvalidate(vaddr, RMP_PG_SIZE_4K, true);
-			if (WARN(ret, "Failed to validate address 0x%lx ret %d", paddr, ret))
-				goto e_term;
-		}
+		/* Page validation must be performed after changing to private */
+		if (op == SNP_PAGE_STATE_PRIVATE)
+			pvalidate_4k_page(vaddr, paddr, true);
 
 		vaddr += PAGE_SIZE;
 		paddr += PAGE_SIZE;
@@ -724,10 +809,7 @@ void __init early_snp_set_memory_private(unsigned long vaddr, unsigned long padd
 	if (!(sev_status & MSR_AMD64_SEV_SNP_ENABLED))
 		return;
 
-	 /*
-	  * Ask the hypervisor to mark the memory pages as private in the RMP
-	  * table.
-	  */
+	 /* Ask hypervisor to mark the memory pages private in the RMP table. */
 	early_set_pages_state(vaddr, paddr, npages, SNP_PAGE_STATE_PRIVATE);
 }
 
@@ -868,8 +950,7 @@ void snp_set_memory_private(unsigned long vaddr, unsigned long npages)
 
 void snp_accept_memory(phys_addr_t start, phys_addr_t end)
 {
-	unsigned long vaddr;
-	unsigned int npages;
+	unsigned long vaddr, npages;
 
 	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
 		return;
@@ -880,7 +961,7 @@ void snp_accept_memory(phys_addr_t start, phys_addr_t end)
 	set_pages_state(vaddr, npages, SNP_PAGE_STATE_PRIVATE);
 }
 
-static int snp_set_vmsa(void *va, bool vmsa)
+static int base_snp_set_vmsa(void *vmsa, void *caa, int apic_id, bool set_vmsa)
 {
 	u64 attrs;
 
@@ -892,10 +973,44 @@ static int snp_set_vmsa(void *va, bool vmsa)
 	 * instruction in the AMD64 APM Volume 3).
 	 */
 	attrs = 1;
-	if (vmsa)
+	if (set_vmsa)
 		attrs |= RMPADJUST_VMSA_PAGE_BIT;
 
-	return rmpadjust((unsigned long)va, RMP_PG_SIZE_4K, attrs);
+	return rmpadjust((unsigned long)vmsa, RMP_PG_SIZE_4K, attrs);
+}
+
+static int svsm_snp_set_vmsa(void *vmsa, void *caa, int apic_id, bool set_vmsa)
+{
+	struct svsm_call call = {};
+	unsigned long flags;
+	int ret;
+
+	local_irq_save(flags);
+
+	call.caa = this_cpu_read(svsm_caa);
+	call.rcx = __pa(vmsa);
+
+	if (set_vmsa) {
+		/* Protocol 0, Call ID 2 */
+		call.rax = 2;
+		call.rdx = __pa(caa);
+		call.r8  = apic_id;
+	} else {
+		/* Protocol 0, Call ID 3 */
+		call.rax = 3;
+	}
+
+	ret = svsm_protocol(&call);
+
+	local_irq_restore(flags);
+
+	return ret;
+}
+
+static int snp_set_vmsa(void *vmsa, void *caa, int apic_id, bool set_vmsa)
+{
+	return svsm_vmpl ? svsm_snp_set_vmsa(vmsa, caa, apic_id, set_vmsa)
+			 : base_snp_set_vmsa(vmsa, caa, apic_id, set_vmsa);
 }
 
 #define __ATTR_BASE		(SVM_SELECTOR_P_MASK | SVM_SELECTOR_S_MASK)
@@ -929,11 +1044,11 @@ static void *snp_alloc_vmsa_page(void)
 	return page_address(p + 1);
 }
 
-static void snp_cleanup_vmsa(struct sev_es_save_area *vmsa)
+static void snp_cleanup_vmsa(struct sev_es_save_area *vmsa, int apic_id)
 {
 	int err;
 
-	err = snp_set_vmsa(vmsa, false);
+	err = snp_set_vmsa(vmsa, NULL, apic_id, false);
 	if (err)
 		pr_err("clear VMSA page failed (%u), leaking page\n", err);
 	else
@@ -944,6 +1059,7 @@ static int wakeup_cpu_via_vmgexit(int apic_id, unsigned long start_ip)
 {
 	struct sev_es_save_area *cur_vmsa, *vmsa;
 	struct ghcb_state state;
+	struct svsm_caa *caa;
 	unsigned long flags;
 	struct ghcb *ghcb;
 	u8 sipi_vector;
@@ -989,6 +1105,12 @@ static int wakeup_cpu_via_vmgexit(int apic_id, unsigned long start_ip)
 	vmsa = (struct sev_es_save_area *)snp_alloc_vmsa_page();
 	if (!vmsa)
 		return -ENOMEM;
+
+	/*
+	 * If an SVSM is present, then the SVSM CAA per-CPU variable will
+	 * have a value, otherwise it will be NULL.
+	 */
+	caa = per_cpu(svsm_caa, cpu);
 
 	/* CR4 should maintain the MCE value */
 	cr4 = native_read_cr4() & X86_CR4_MCE;
@@ -1037,11 +1159,11 @@ static int wakeup_cpu_via_vmgexit(int apic_id, unsigned long start_ip)
 	 *   VMPL level
 	 *   SEV_FEATURES (matches the SEV STATUS MSR right shifted 2 bits)
 	 */
-	vmsa->vmpl		= 0;
+	vmsa->vmpl		= svsm_vmpl;
 	vmsa->sev_features	= sev_status >> 2;
 
 	/* Switch the page over to a VMSA page now that it is initialized */
-	ret = snp_set_vmsa(vmsa, true);
+	ret = snp_set_vmsa(vmsa, caa, apic_id, true);
 	if (ret) {
 		pr_err("set VMSA page failed (%u)\n", ret);
 		free_page((unsigned long)vmsa);
@@ -1057,7 +1179,10 @@ static int wakeup_cpu_via_vmgexit(int apic_id, unsigned long start_ip)
 	vc_ghcb_invalidate(ghcb);
 	ghcb_set_rax(ghcb, vmsa->sev_features);
 	ghcb_set_sw_exit_code(ghcb, SVM_VMGEXIT_AP_CREATION);
-	ghcb_set_sw_exit_info_1(ghcb, ((u64)apic_id << 32) | SVM_VMGEXIT_AP_CREATE);
+	ghcb_set_sw_exit_info_1(ghcb,
+				((u64)apic_id << 32)	|
+				((u64)svsm_vmpl << 16)	|
+				SVM_VMGEXIT_AP_CREATE);
 	ghcb_set_sw_exit_info_2(ghcb, __pa(vmsa));
 
 	sev_es_wr_ghcb_msr(__pa(ghcb));
@@ -1075,13 +1200,13 @@ static int wakeup_cpu_via_vmgexit(int apic_id, unsigned long start_ip)
 
 	/* Perform cleanup if there was an error */
 	if (ret) {
-		snp_cleanup_vmsa(vmsa);
+		snp_cleanup_vmsa(vmsa, apic_id);
 		vmsa = NULL;
 	}
 
 	/* Free up any previous VMSA page */
 	if (cur_vmsa)
-		snp_cleanup_vmsa(cur_vmsa);
+		snp_cleanup_vmsa(cur_vmsa, apic_id);
 
 	/* Record the current VMSA page */
 	per_cpu(sev_vmsa, cpu) = vmsa;
@@ -1167,11 +1292,28 @@ int __init sev_es_efi_map_ghcbs(pgd_t *pgd)
 	return 0;
 }
 
+static enum es_result vc_handle_svsm_caa_msr(struct es_em_ctxt *ctxt)
+{
+	struct pt_regs *regs = ctxt->regs;
+
+	/* Writes to the SVSM CAA msr are ignored */
+	if (ctxt->insn.opcode.bytes[1] == 0x30)
+		return ES_OK;
+
+	regs->ax = lower_32_bits(this_cpu_read(svsm_caa_pa));
+	regs->dx = upper_32_bits(this_cpu_read(svsm_caa_pa));
+
+	return ES_OK;
+}
+
 static enum es_result vc_handle_msr(struct ghcb *ghcb, struct es_em_ctxt *ctxt)
 {
 	struct pt_regs *regs = ctxt->regs;
 	enum es_result ret;
 	u64 exit_info_1;
+
+	if (regs->cx == MSR_SVSM_CAA)
+		return vc_handle_svsm_caa_msr(ctxt);
 
 	/* Is it a WRMSR? */
 	exit_info_1 = (ctxt->insn.opcode.bytes[1] == 0x30) ? 1 : 0;
@@ -1310,6 +1452,18 @@ static void __init alloc_runtime_data(int cpu)
 		panic("Can't allocate SEV-ES runtime data");
 
 	per_cpu(runtime_data, cpu) = data;
+
+	if (svsm_vmpl) {
+		struct svsm_caa *caa;
+
+		/* Allocate the SVSM CAA page if an SVSM is present */
+		caa = memblock_alloc(sizeof(*caa), PAGE_SIZE);
+		if (!caa)
+			panic("Can't allocate SVSM CAA page\n");
+
+		per_cpu(svsm_caa, cpu) = caa;
+		per_cpu(svsm_caa_pa, cpu) = __pa(caa);
+	}
 }
 
 static void __init init_ghcb(int cpu)
@@ -1357,6 +1511,31 @@ void __init sev_es_init_vc_handling(void)
 	for_each_possible_cpu(cpu) {
 		alloc_runtime_data(cpu);
 		init_ghcb(cpu);
+	}
+
+	/* If running under an SVSM, switch to the per-cpu CAA area */
+	if (svsm_vmpl) {
+		struct svsm_call call = {};
+		unsigned long flags;
+		int ret;
+
+		local_irq_save(flags);
+
+		/*
+		 * SVSM_CORE_REMAP_CA call:
+		 *   RAX = 0 (Protocol=0, CallID=0)
+		 *   RCX = New CAA GPA
+		 */
+		call.caa = __svsm_get_caa();
+		call.rax = 0;
+		call.rcx = this_cpu_read(svsm_caa_pa);
+		ret = svsm_protocol(&call);
+		if (ret != SVSM_SUCCESS)
+			panic("Can't remap the SVSM CAA page, ret=%#x (%d)\n", ret, ret);
+
+		sev_cfg.cas_initialized = true;
+
+		local_irq_restore(flags);
 	}
 
 	sev_es_setup_play_dead();
@@ -1771,33 +1950,6 @@ static enum es_result vc_handle_exitcode(struct es_em_ctxt *ctxt,
 	return result;
 }
 
-static __always_inline void vc_forward_exception(struct es_em_ctxt *ctxt)
-{
-	long error_code = ctxt->fi.error_code;
-	int trapnr = ctxt->fi.vector;
-
-	ctxt->regs->orig_ax = ctxt->fi.error_code;
-
-	switch (trapnr) {
-	case X86_TRAP_GP:
-		exc_general_protection(ctxt->regs, error_code);
-		break;
-	case X86_TRAP_UD:
-		exc_invalid_op(ctxt->regs);
-		break;
-	case X86_TRAP_PF:
-		write_cr2(ctxt->fi.cr2);
-		exc_page_fault(ctxt->regs, error_code);
-		break;
-	case X86_TRAP_AC:
-		exc_alignment_check(ctxt->regs, error_code);
-		break;
-	default:
-		pr_emerg("Unsupported exception in #VC instruction emulation - can't continue\n");
-		BUG();
-	}
-}
-
 static __always_inline bool is_vc2_stack(unsigned long sp)
 {
 	return (sp >= __this_cpu_ist_bottom_va(VC2) && sp < __this_cpu_ist_top_va(VC2));
@@ -2047,7 +2199,50 @@ found_cc_info:
 	return cc_info;
 }
 
-bool __init snp_init(struct boot_params *bp)
+static __init void setup_svsm(struct cc_blob_sev_info *cc_info, unsigned long physbase)
+{
+	struct svsm_call call = {};
+	unsigned long pa;
+	int ret;
+
+	/*
+	 * Record the address of the SVSM CAA if the guest is not running
+	 * at VMPL0. The CAA will be used to communicate with the SVSM to
+	 * perform the SVSM services.
+	 */
+	setup_svsm_caa(cc_info);
+
+	/* Nothing to do if not running under an SVSM. */
+	if (!svsm_vmpl)
+		return;
+
+	/*
+	 * It is very early in the boot and the kernel is running identity
+	 * mapped, so the calculated physical address needs to be adjusted
+	 * for where the kernel is loaded.
+	 */
+	pa = (unsigned long)&boot_svsm_caa_page - (unsigned long)_text + physbase;
+
+	/*
+	 * Switch over to the boot SVSM CAA while the current CAA is still
+	 * addressable. There is no GHCB at this point so use the MSR protocol.
+	 *
+	 * SVSM_CORE_REMAP_CA call:
+	 *   RAX = 0 (Protocol=0, CallID=0)
+	 *   RCX = New CAA GPA
+	 */
+	call.caa = __svsm_get_caa();
+	call.rax = 0;
+	call.rcx = pa;
+	ret = svsm_protocol(&call);
+	if (ret != SVSM_SUCCESS)
+		panic("Can't remap the SVSM CAA page, ret=%#x (%d)\n", ret, ret);
+
+	boot_svsm_caa = (struct svsm_caa *)pa;
+	boot_svsm_caa_pa = pa;
+}
+
+bool __init snp_init(struct boot_params *bp, unsigned long physbase)
 {
 	struct cc_blob_sev_info *cc_info;
 
@@ -2059,6 +2254,8 @@ bool __init snp_init(struct boot_params *bp)
 		return false;
 
 	setup_cpuid_table(cc_info);
+
+	setup_svsm(cc_info, physbase);
 
 	/*
 	 * The CC blob will be used later to access the secrets page. Cache
@@ -2098,22 +2295,36 @@ static void dump_cpuid_table(void)
  * sort of indicator, and there's not really any other good place to do it,
  * so do it here.
  */
-static int __init report_cpuid_table(void)
+static void __init report_cpuid_table(void)
 {
 	const struct snp_cpuid_table *cpuid_table = snp_cpuid_get_table();
 
 	if (!cpuid_table->count)
-		return 0;
+		return;
 
 	pr_info("Using SNP CPUID table, %d entries present.\n",
 		cpuid_table->count);
 
 	if (sev_cfg.debug)
 		dump_cpuid_table();
+}
+
+static void __init report_vmpl_level(void)
+{
+	if (!cc_platform_has(CC_ATTR_GUEST_SEV_SNP))
+		return;
+
+	pr_info("SNP running at VMPL%u.\n", svsm_vmpl);
+}
+
+static int __init report_snp_info(void)
+{
+	report_vmpl_level();
+	report_cpuid_table();
 
 	return 0;
 }
-arch_initcall(report_cpuid_table);
+arch_initcall(report_snp_info);
 
 static int __init init_sev_config(char *str)
 {
@@ -2196,6 +2407,12 @@ e_restore_irq:
 }
 EXPORT_SYMBOL_GPL(snp_issue_guest_request);
 
+int snp_get_vmpl(void)
+{
+	return svsm_vmpl;
+}
+EXPORT_SYMBOL_GPL(snp_get_vmpl);
+
 static struct platform_device sev_guest_device = {
 	.name		= "sev-guest",
 	.id		= -1,
@@ -2224,3 +2441,12 @@ static int __init snp_init_platform_device(void)
 	return 0;
 }
 device_initcall(snp_init_platform_device);
+
+void __init snp_remap_svsm_caa(void)
+{
+	if (!svsm_vmpl)
+		return;
+
+	/* Update the CAA address to a proper kernel address */
+	boot_svsm_caa = &boot_svsm_caa_page;
+}

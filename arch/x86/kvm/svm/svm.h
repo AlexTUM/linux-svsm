@@ -74,9 +74,13 @@ enum {
 /* TPR and CR2 are always written before VMRUN */
 #define VMCB_ALWAYS_DIRTY_MASK	((1U << VMCB_INTR) | (1U << VMCB_CR2))
 
+/* Supported init feature flags */
+#define SEV_SNP_SUPPORTED_FLAGS		(KVM_SEV_SNP_RESTRICTED_INJET | KVM_SEV_SNP_SVSM)
+
 struct kvm_sev_info {
 	bool active;		/* SEV enabled guest */
 	bool es_active;		/* SEV-ES enabled guest */
+	bool snp_active;	/* SEV-SNP enabled guest */
 	unsigned int asid;	/* ASID used for this guest */
 	unsigned int handle;	/* SEV firmware handle */
 	int fd;			/* SEV device fd */
@@ -88,6 +92,11 @@ struct kvm_sev_info {
 	struct list_head mirror_entry; /* Use as a list entry of mirrors */
 	struct misc_cg *misc_cg; /* For misc cgroup accounting */
 	atomic_t migration_in_progress;
+	u64 snp_init_flags;
+	void *snp_context;      /* SNP guest context page */
+	u64 sev_features[SVM_SEV_VMPL_MAX]; /* Features set at VMSA creation */
+	struct sev_snp_certs *snp_certs;
+	struct mutex guest_req_lock; /* Lock for guest request handling */
 };
 
 struct kvm_svm {
@@ -186,13 +195,35 @@ struct svm_nested_state {
 	bool force_msr_bitmap_recalc;
 };
 
+struct vmpl_switch_sa {
+	u32  exit_int_info;
+	u32  exit_int_info_err;
+
+	unsigned long cr0;
+	unsigned long cr2;
+	unsigned long cr4;
+	unsigned long cr8;
+	u64 efer;
+};
+
+struct snp_vmsa_update {
+	gpa_t gpa;
+	bool  ap_create;	/* SEV-SNP AP Creation */
+};
+
 struct vcpu_sev_es_state {
-	/* SEV-ES support */
+	/* SEV-ES/SEV-SNP support */
 	struct sev_es_save_area *vmsa;
 	struct ghcb *ghcb;
 	u8 valid_bitmap[16];
 	struct kvm_host_map ghcb_map;
+
+	hpa_t vmsa_pa[SVM_SEV_VMPL_MAX];
+	gpa_t ghcb_gpa[SVM_SEV_VMPL_MAX];
+	u64 ghcb_registered_gpa[SVM_SEV_VMPL_MAX];
+
 	bool received_first_sipi;
+	unsigned int ap_reset_hold_type;
 
 	/* SEV-ES scratch area support */
 	u64 sw_scratch;
@@ -200,6 +231,13 @@ struct vcpu_sev_es_state {
 	u32 ghcb_sa_len;
 	bool ghcb_sa_sync;
 	bool ghcb_sa_free;
+
+	struct mutex snp_vmsa_mutex; /* Used to handle concurrent updates of VMSA. */
+	struct snp_vmsa_update snp_vmsa[SVM_SEV_VMPL_MAX];
+	unsigned int snp_current_vmpl;
+	unsigned int snp_target_vmpl;
+
+	struct vmpl_switch_sa vssa[SVM_SEV_VMPL_MAX];
 };
 
 struct vcpu_svm {
@@ -344,6 +382,23 @@ static __always_inline bool sev_es_guest(struct kvm *kvm)
 #else
 	return false;
 #endif
+}
+
+static __always_inline bool sev_snp_guest(struct kvm *kvm)
+{
+	struct kvm_sev_info *sev = &to_kvm_svm(kvm)->sev_info;
+
+	return sev_es_guest(kvm) && sev->snp_active;
+}
+
+static inline bool has_snp_feature(struct kvm_sev_info *sev, u64 flag)
+{
+	return sev->snp_init_flags & flag;
+}
+
+static inline bool ghcb_gpa_is_registered(struct vcpu_svm *svm, u64 val)
+{
+	return svm->sev_es.ghcb_registered_gpa[svm->sev_es.snp_current_vmpl] == val;
 }
 
 static inline void vmcb_mark_all_dirty(struct vmcb *vmcb)
@@ -711,9 +766,12 @@ void avic_refresh_virtual_apic_mode(struct kvm_vcpu *vcpu);
 
 /* sev.c */
 
-#define GHCB_VERSION_MAX	1ULL
+#define GHCB_VERSION_MAX	2ULL
 #define GHCB_VERSION_MIN	1ULL
 
+#define GHCB_HV_FT_SUPPORTED	(GHCB_HV_FT_SNP |		\
+				 GHCB_HV_FT_SNP_AP_CREATION |	\
+				 GHCB_HV_FT_SNP_SVSM)
 
 extern unsigned int max_sev_asid;
 
@@ -740,6 +798,15 @@ void sev_es_vcpu_reset(struct vcpu_svm *svm);
 void sev_vcpu_deliver_sipi_vector(struct kvm_vcpu *vcpu, u8 vector);
 void sev_es_prepare_switch_to_guest(struct sev_es_save_area *hostsa);
 void sev_es_unmap_ghcb(struct vcpu_svm *svm);
+struct page *snp_safe_alloc_page(struct kvm_vcpu *vcpu);
+void handle_rmp_page_fault(struct kvm_vcpu *vcpu, gpa_t gpa, u64 error_code);
+bool sev_snp_init_protected_guest_state(struct kvm_vcpu *vcpu);
+int sev_gmem_prepare(struct kvm *kvm, struct kvm_memory_slot *slot,
+		     kvm_pfn_t pfn, gfn_t gfn, u8 *max_level);
+void sev_gmem_invalidate(struct kvm *kvm, kvm_pfn_t start, kvm_pfn_t end);
+bool sev_snp_is_rinj_active(struct kvm_vcpu *vcpu);
+bool sev_snp_nmi_blocked(struct kvm_vcpu *vcpu);
+bool sev_snp_interrupt_blocked(struct kvm_vcpu *vcpu);
 
 /* vmenter.S */
 

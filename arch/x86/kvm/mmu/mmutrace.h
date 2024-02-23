@@ -58,6 +58,7 @@ TRACE_DEFINE_ENUM(RET_PF_CONTINUE);
 TRACE_DEFINE_ENUM(RET_PF_RETRY);
 TRACE_DEFINE_ENUM(RET_PF_EMULATE);
 TRACE_DEFINE_ENUM(RET_PF_INVALID);
+TRACE_DEFINE_ENUM(RET_PF_USER);
 TRACE_DEFINE_ENUM(RET_PF_FIXED);
 TRACE_DEFINE_ENUM(RET_PF_SPURIOUS);
 
@@ -363,6 +364,33 @@ TRACE_EVENT(
 		  __entry->x ? "x" : "-",
 		  __entry->u == -1 ? "" : (__entry->u ? "u" : "-"),
 		  __entry->level, __entry->sptep
+	)
+);
+
+TRACE_EVENT(
+	kvm_mmu_faultin_private,
+	TP_PROTO(struct kvm_page_fault *fault),
+	TP_ARGS(fault),
+
+	TP_STRUCT__entry(
+		__field(u64, gfn)
+		__field(u64, pfn)
+		__field(u8, max_level)
+		__field(u8, req_level)
+		__field(u8, goal_level)
+	),
+
+	TP_fast_assign(
+		__entry->gfn = fault->gfn;
+		__entry->pfn = fault->pfn;
+		__entry->max_level = fault->max_level;
+		__entry->req_level = fault->req_level;
+		__entry->goal_level = fault->goal_level;
+	),
+
+	TP_printk("gfn %llx pfn %llx max_level %d req_level %d goal_level %d",
+		  __entry->gfn, __entry->pfn, __entry->max_level,
+		  __entry->req_level, __entry->goal_level
 	)
 );
 

@@ -30,6 +30,7 @@
 #include <asm/io_apic.h>
 #include <asm/irq_remapping.h>
 #include <asm/set_memory.h>
+#include <asm/sev-host.h>
 
 #include <linux/crash_dump.h>
 
@@ -3745,7 +3746,7 @@ int amd_iommu_pc_set_reg(struct amd_iommu *iommu, u8 bank, u8 cntr, u8 fxn, u64 
 	return iommu_pc_get_set_reg(iommu, bank, cntr, fxn, value, true);
 }
 
-#ifdef CONFIG_AMD_MEM_ENCRYPT
+#ifdef CONFIG_KVM_AMD_SEV
 int amd_iommu_snp_enable(void)
 {
 	/*
@@ -3753,7 +3754,7 @@ int amd_iommu_snp_enable(void)
 	 * not configured in the passthrough mode.
 	 */
 	if (no_iommu || iommu_default_passthrough()) {
-		pr_err("SNP: IOMMU is disabled or configured in passthrough mode, SNP cannot be supported");
+		pr_err("SNP: IOMMU is disabled or configured in passthrough mode, SNP cannot be supported.\n");
 		return -EINVAL;
 	}
 
@@ -3768,17 +3769,73 @@ int amd_iommu_snp_enable(void)
 	}
 
 	amd_iommu_snp_en = check_feature_on_all_iommus(FEATURE_SNP);
-	if (!amd_iommu_snp_en)
+	if (!amd_iommu_snp_en) {
+		pr_err("SNP: IOMMU does not support SNP feature, SNP cannot be supported.\n");
 		return -EINVAL;
+	}
 
 	pr_info("SNP enabled\n");
 
 	/* Enforce IOMMU v1 pagetable when SNP is enabled. */
 	if (amd_iommu_pgtable != AMD_IOMMU_V1) {
-		pr_warn("Force to using AMD IOMMU v1 page table due to SNP\n");
+		pr_warn("Force to using AMD IOMMU v1 page table due to SNP.\n");
 		amd_iommu_pgtable = AMD_IOMMU_V1;
 	}
 
 	return 0;
 }
+
+static int iommu_page_make_shared(void *page)
+{
+	unsigned long paddr, pfn;
+
+	paddr = iommu_virt_to_phys(page);
+	/* Cbit maybe set in the paddr */
+	pfn = __sme_clr(paddr) >> PAGE_SHIFT;
+	return rmp_make_shared(pfn, PG_LEVEL_4K);
+}
+
+static int iommu_make_shared(void *va, size_t size)
+{
+	void *page;
+	int ret;
+
+	if (!va)
+		return 0;
+
+	for (page = va; page < (va + size); page += PAGE_SIZE) {
+		ret = iommu_page_make_shared(page);
+		if (ret)
+			return ret;
+	}
+
+	return 0;
+}
+
+int amd_iommu_snp_disable(void)
+{
+	struct amd_iommu *iommu;
+	int ret;
+
+	if (!amd_iommu_snp_en)
+		return 0;
+
+	for_each_iommu(iommu) {
+		ret = iommu_make_shared(iommu->evt_buf, EVT_BUFFER_SIZE);
+		if (ret)
+			return ret;
+
+		ret = iommu_make_shared(iommu->ppr_log, PPR_LOG_SIZE);
+		if (ret)
+			return ret;
+
+		ret = iommu_make_shared((void *)iommu->cmd_sem, PAGE_SIZE);
+		if (ret)
+			return ret;
+	}
+
+	amd_iommu_snp_en = false;
+	return 0;
+}
+EXPORT_SYMBOL_GPL(amd_iommu_snp_disable);
 #endif

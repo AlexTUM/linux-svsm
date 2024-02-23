@@ -29,9 +29,18 @@
 #define SEV_CMD_COMPLETE		BIT(1)
 #define SEV_CMDRESP_IOC			BIT(0)
 
+#define MAX_SNP_HOST_MAP_BUFS		2
+
 struct sev_misc_dev {
 	struct kref refcount;
 	struct miscdevice misc;
+};
+
+struct snp_host_map {
+	u64 paddr;
+	u32 len;
+	void *host;
+	bool active;
 };
 
 struct sev_device {
@@ -52,6 +61,13 @@ struct sev_device {
 	u8 build;
 
 	void *cmd_buf;
+	void *cmd_buf_backup;
+	int cmd_buf_active;
+
+	bool snp_initialized;
+	struct snp_host_map snp_host_map[MAX_SNP_HOST_MAP_BUFS];
+	struct sev_snp_certs *snp_certs;
+	struct sev_user_data_snp_config snp_config;
 };
 
 int sev_dev_init(struct psp_device *psp);

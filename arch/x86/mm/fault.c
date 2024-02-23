@@ -34,6 +34,7 @@
 #include <asm/kvm_para.h>		/* kvm_handle_async_pf		*/
 #include <asm/vdso.h>			/* fixup_vdso_exception()	*/
 #include <asm/irq_stack.h>
+#include <asm/sev-host.h>		/* sev_dump_rmpentry()          */
 
 #define CREATE_TRACE_POINTS
 #include <asm/trace/exceptions.h>
@@ -547,6 +548,7 @@ show_fault_oops(struct pt_regs *regs, unsigned long error_code, unsigned long ad
 		 !(error_code & X86_PF_PROT) ? "not-present page" :
 		 (error_code & X86_PF_RSVD)  ? "reserved bit violation" :
 		 (error_code & X86_PF_PK)    ? "protection keys violation" :
+		 (error_code & X86_PF_RMP)   ? "RMP violation" :
 					       "permissions violation");
 
 	if (!(error_code & X86_PF_USER) && user_mode(regs)) {
@@ -579,6 +581,18 @@ show_fault_oops(struct pt_regs *regs, unsigned long error_code, unsigned long ad
 	}
 
 	dump_pagetable(address);
+
+	if (error_code & X86_PF_RMP) {
+		unsigned int level;
+		pgd_t *pgd;
+		pte_t *pte;
+
+		pgd = __va(read_cr3_pa());
+		pgd += pgd_index(address);
+		pte = lookup_address_in_pgd(pgd, address, &level);
+
+		sev_dump_rmpentry(pte_pfn(*pte));
+	}
 }
 
 static noinline void
@@ -1309,6 +1323,13 @@ void do_user_addr_fault(struct pt_regs *regs,
 		flags |= FAULT_FLAG_WRITE;
 	if (error_code & X86_PF_INSTR)
 		flags |= FAULT_FLAG_INSTRUCTION;
+
+	if (error_code & X86_PF_RMP) {
+		pr_err("Unexpected RMP page fault for address 0x%lx, terminating process\n",
+		       address);
+		do_sigbus(regs, error_code, address, VM_FAULT_SIGBUS);
+		return;
+	}
 
 #ifdef CONFIG_X86_64
 	/*
