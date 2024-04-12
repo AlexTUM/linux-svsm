@@ -1,6 +1,8 @@
 #include <asm/page_types.h>
 #include <crypto/hash.h>
 #include <crypto/sha2.h>
+#include <asm/sev.h>
+#include <efi.h>
 
 /* given an address/memory page, check if the c-bit is set, meaning it is encrypted by hardware*/
 static int check_encrypted(void *add)
@@ -85,4 +87,13 @@ static int check_guest_valid(void *add)
 /* given a range of addresses/pages, check for all of them if they are fully protected by SEV SNP*/
 static int check_integrity(void *range)
 {
+}
+
+static int request_att(unsigned char *hash)
+{
+	u64 exit_code;
+	struct snp_req_data *input;
+	struct snp_guest_request_ioctl *rio;
+
+	snp_issue_guest_request(exit_code, input, rio);
 }
