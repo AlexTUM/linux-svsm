@@ -2,7 +2,10 @@
 #include <crypto/hash.h>
 #include <crypto/sha2.h>
 #include <asm/sev.h>
-#include <efi.h>
+#include <uapi/linux/sev-guest.h>
+#include <linux/efi.h>
+
+#define SEV_DEV_PATH "/dev/sev"
 
 /* given an address/memory page, check if the c-bit is set, meaning it is encrypted by hardware*/
 static int check_encrypted(void *add)
@@ -91,9 +94,15 @@ static int check_integrity(void *range)
 
 static int request_att(unsigned char *hash)
 {
-	u64 exit_code;
-	struct snp_req_data *input;
-	struct snp_guest_request_ioctl *rio;
+	// u64 exit_code;
+	// struct snp_req_data *input;
+	// struct snp_guest_request_ioctl *rio;
 
-	snp_issue_guest_request(exit_code, input, rio);
+	//snp_issue_guest_request(exit_code, input, rio);
+
+	struct file *snp_file;
+
+	snp_file = filp_open(SEV_DEV_PATH, O_RDONLY);
+
+	snp_guest_ioctl(snp_file, ioctl, user);
 }
